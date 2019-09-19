@@ -1,3 +1,74 @@
 #!/usr/bin/env python3
+import sys
+import argparse
 
 
+class RefFile:
+    def __init__(self, reffile):
+        self.chromosome = []
+        self.start_pos = []
+        self.end_pos = []
+        self.nm_id = []
+        self.zero = []
+        self.strand = []
+
+        line_counter = 0
+
+        for line in reffile:
+
+            line_counter += 1 
+            fields = line.split('\t')
+
+            if len(fields) != 6:
+                raise Exception("Reference file doesn't contain 6 fields") 
+
+            self.chromosome.append(fields[0])
+            self.start_pos.append(fields[1])
+            self.end_pos.append(fields[2])
+            self.nm_id.append(fields[3])
+            self.zero.append(fields[4])
+            self.strand.append(fields[5])
+
+        self.length = line_counter
+
+
+def parseArgs():
+    """Parse command line arguments in c style fashion."""
+
+    parser = argparse.ArgumentParser(
+        description="""Translates relative 5u 3u positions into their absolute
+                       reference position in BED format"""
+    )
+    parser.add_argument('-5', '--utrref5', required=True,
+                        help="The path to the 5'utr reference file.")
+    parser.add_argument('-3', '--utrref3', required=True,
+                        help="The path to the 3'utr reference file.")
+    parser.add_argument('-i', '--input',   required=True,
+                        help="The path to the file with the relative positions")
+
+    return parser.parse_args();
+
+
+def openRefFile(ref_filename):
+    """Open reference file and return parsed reference class."""  
+    
+    # open reference file
+    reffile = open(ref_filename, 'r')
+    return RefFile(reffile)
+
+
+def main():
+    """main."""
+    
+    args = parseArgs()
+
+    # parse reference files
+    try:
+        utr5_ref = openRefFile(args.utrref5)
+        utr3_ref = openRefFile(args.utrref3)
+    except Exception as e:
+        print(e)
+        return
+
+
+main()
