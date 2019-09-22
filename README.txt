@@ -1,4 +1,10 @@
-# rel2bed
+###############################################################################
+rel2bed
+
+by: Jae Chan Hwang (hwangjc)
+09/22/2019
+###############################################################################
+
 usage: rel2bed [-h] -5 UTRREF5 -3 UTRREF3 -i INPUT
 
 Translates relative 5u 3u positions into their absolute reference position in
