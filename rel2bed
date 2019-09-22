@@ -1,71 +1,263 @@
 #!/usr/bin/env python3
-import sys
 import argparse
+import io
+import sys
+import threading
+import queue
 
+from io import StringIO
 
-class RefFile:
-    def __init__(self, reffile):
-        self.chromosome = []
-        self.start_pos = []
-        self.end_pos = []
-        self.nm_id = []
-        self.zero = []
-        self.strand = []
-
-        line_counter = 0
-
-        for line in reffile:
-
-            line_counter += 1 
-            fields = line.split('\t')
-
-            if len(fields) != 6:
-                raise Exception("Reference file doesn't contain 6 fields") 
-
-            self.chromosome.append(fields[0])
-            self.start_pos.append(fields[1])
-            self.end_pos.append(fields[2])
-            self.nm_id.append(fields[3])
-            self.zero.append(fields[4])
-            self.strand.append(fields[5])
-
-        self.length = line_counter
-
+qlock = threading.Lock()
+ret_queue = queue.Queue()
 
 def parseArgs():
     """Parse command line arguments in c style fashion."""
 
     parser = argparse.ArgumentParser(
         description="""Translates relative 5u 3u positions into their absolute
-                       reference position in BED format"""
+                       reference position in BED format."""
     )
     parser.add_argument('-5', '--utrref5', required=True,
                         help="The path to the 5'utr reference file.")
     parser.add_argument('-3', '--utrref3', required=True,
                         help="The path to the 3'utr reference file.")
     parser.add_argument('-i', '--input',   required=True,
-                        help="The path to the file with the relative positions")
+                        help="The path to the file with the relative positions.")
 
     return parser.parse_args();
 
 
-def openRefFile(ref_filename):
+def parseNMID(string):
+    """Parse out NM_ID from string."""
+
+    # assert that the first three characters are "NM_"
+    assert(string[0:3] == "NM_"), "NM_ID is incorrectly formatted"
+
+    nm_id_str = "NM_"
+    i = 3
+    while (i < len(string) and (string[i] >= '0' and string[i] <= '9')):
+        nm_id_str += string[i]
+        i += 1
+
+    return nm_id_str 
+
+
+class RefFile:
+    """Class abstraction for a reference file. Allows easy access to each field
+    in the file."""
+    def __init__(self, reffile, utr):
+        # ref is a dictionary of 
+        # NM_ID -> dictionary -> [(chromosome, start position, end position, ...),...]
+        self.utr = utr;
+        self.ref = {}
+        line_counter = 0
+
+        for line in reffile:
+            line_counter += 1 
+            fields = line.split('\t')
+
+            if len(fields) != 6:
+                raise Exception("Reference file doesn't contain 6 fields") 
+
+            data = {} 
+            nm_id = parseNMID(fields[3])
+
+            data["chromosome"] = fields[0]
+            data["start_pos"] = int(fields[1])
+            data["end_pos"] = int(fields[2])
+            data["nm_id_full"] = fields[3]
+            data["zero"] = int(fields[4])
+            data["strand"] = fields[5][:-1]
+
+            if nm_id not in self.ref:
+                self.ref[nm_id] = []
+            self.ref[nm_id].append(data)
+ 
+
+        self.length = line_counter
+
+
+def openRefFile(ref_filename, utr):
     """Open reference file and return parsed reference class."""  
     
     # open reference file
     reffile = open(ref_filename, 'r')
-    return RefFile(reffile)
+    return RefFile(reffile, utr)
 
 
+def parseInputFile(input_filename, utr5_ref, utr3_ref):
+    """Open relative position file and find absolute positions."""
+
+    ###########################################################################
+    #
+    # I assume that the format of the relative position file is:
+    # 
+    # NM_ID | 5'UTR start pos | 3'UTR start pos | 5'UTR seq | 3'UTR seq | extra
+    #
+    # where extra can me any additional columns.
+    # I also assume that the file is delimited with tabs.
+    #
+    ###########################################################################
+
+    t1 = threading.Thread(target=calcAbsPos, args=(input_filename, utr5_ref))
+    t2 = threading.Thread(target=calcAbsPos, args=(input_filename, utr3_ref))
+        
+    t1.start()
+    t2.start()
+
+    t1.join()
+    t2.join()
+
+    out1 = ret_queue.get()
+    out2 = ret_queue.get()
+
+    print(out1.getvalue() + out2.getvalue())
+    out1.close()
+    out2.close()
+
+def calcAbsPos(input_filename, utr_ref):
+    """Calculate the absolute position given the relative positions."""
+
+    # open relative position file
+    relfile = open(input_filename, 'r')
+    # open c++ style string stream
+    oss = StringIO()
+
+    for line in relfile:
+        fields = line.split('\t')
+
+        # parse out information from the relative position file
+        nm_id = parseNMID(fields[0])
+        start = int(fields[1]) if utr_ref.utr == 5 else int(fields[2])
+        if len(fields) > 5:
+            seq = fields[3] if utr_ref.utr == 5 else fields[4][::-1]
+            extra = fields[5:]
+        else:
+            seq = fields[3] if utr_ref.utr == 5 else fields[4][:-1][::-1]
+            extra = None
+
+        prime_string = "_5U" if utr_ref.utr == 5 else "_3U"
+
+        # calculate absolute start position 
+        if nm_id in utr_ref.ref:
+            strand = utr_ref.ref[nm_id][0]["strand"]
+
+            ###################################################################
+            # negative strand computation
+            ###################################################################
+            if strand == "-": # negative strand computation
+                # first we find the ending position of the sequence
+                remaining = start - 1
+                # start from the end and calculate the ending position
+                k = len(utr_ref.ref[nm_id]) - 1
+                current_start = utr_ref.ref[nm_id][k]["start_pos"]
+                current_end   = utr_ref.ref[nm_id][k]["end_pos"]
+                while (remaining >= current_end - current_start):
+                    remaining -= (current_end - current_start)
+                    k -= 1
+                    current_start = utr_ref.ref[nm_id][k]["start_pos"]
+                    current_end   = utr_ref.ref[nm_id][k]["end_pos"]
+                absolute_end = current_end - remaining
+                absolute_start = absolute_end
+
+                # find the starting position
+                seq_length_remaining = len(seq) - 1
+                while (seq_length_remaining != 0):
+                    absolute_start -= 1
+                    seq_length_remaining -= 1
+                    if absolute_start == current_start: 
+                        # print output for current exon segment
+                        oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
+                            str(absolute_start) + "\t" + str(absolute_end) + "\t" +
+                            nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
+                            "\t" + seq)
+                        if extra != None:
+                            for field in extra:
+                                oss.write("\t" + field)
+                        else:
+                            oss.write("\n")
+                        # go to the next exon segment
+                        k -= 1
+                        current_end    = utr_ref.ref[nm_id][k]["end_pos"]
+                        current_start  = utr_ref.ref[nm_id][k]["start_pos"]
+                        absolute_end   = current_end
+                        absolute_start = absolute_end
+                # print for the exon segment
+                oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
+                    str(absolute_start - 1) + "\t" + str(absolute_end) + "\t" +
+                    nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
+                    "\t" + seq)
+                if extra != None:
+                    for field in extra:
+                        oss.write("\t" + field)
+                else:
+                    oss.write("\n")
+            ###################################################################
+            # positive strand computation
+            ###################################################################
+            else:
+                # first we need to find the starting position of the sequence
+                remaining = start - 1
+                # start from the beginning and calculate the starting position
+                k = 0
+                current_start = utr_ref.ref[nm_id][k]["start_pos"]
+                current_end   = utr_ref.ref[nm_id][k]["end_pos"]
+                while (remaining >= current_end - current_start):
+                    remaining -= (current_end - current_start)
+                    k += 1
+                    current_start = utr_ref.ref[nm_id][k]["start_pos"]
+                    current_end   = utr_ref.ref[nm_id][k]["end_pos"]
+                absolute_start = current_start + remaining
+                absolute_end = absolute_start
+
+                # find the ending position
+                seq_length_remaining = len(seq) - 1
+                while (seq_length_remaining != 0):
+                    absolute_end += 1
+                    seq_length_remaining -= 1
+                    if absolute_end == current_end:
+                        # print out for current exon segment
+                        oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
+                            str(absolute_start) + "\t" + str(absolute_end) + "\t" +
+                            nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
+                            "\t" + seq)
+                        if extra != None:
+                            for field in extra:
+                                oss.write("\t" + field)
+                        else:
+                            oss.write("\n")
+                        k += 1
+                        current_start  = utr_ref.ref[nm_id][k]["start_pos"]
+                        current_end    = utr_ref.ref[nm_id][k]["end_pos"]
+                        absolute_start = current_start
+                        absolute_end   = absolute_start
+                # print for final exon segment
+                oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
+                    str(absolute_start) + "\t" + str(absolute_end + 1) + "\t" +
+                    nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
+                    "\t" + seq)
+                if extra != None:
+                    for field in extra:
+                        oss.write("\t" + field)
+                else:
+                    oss.write("\n")
+    qlock.acquire()
+    ret_queue.put(oss)
+    qlock.release()
+
+    
 def main():
     """main."""
     
     args = parseArgs()
 
-    # parse reference files
     try:
-        utr5_ref = openRefFile(args.utrref5)
-        utr3_ref = openRefFile(args.utrref3)
+        # parse reference files
+        utr5_ref = openRefFile(args.utrref5, 5)
+        utr3_ref = openRefFile(args.utrref3, 3)
+
+        # parse input file
+        parseInputFile(args.input, utr5_ref, utr3_ref)
     except Exception as e:
         print(e)
         return
