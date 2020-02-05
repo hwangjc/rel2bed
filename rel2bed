@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
+
+###############################################################################
+#                                                                             #
+# Written by Jae Chan Hwang - hwangjc@umich.edu                               #
+# 11/07/2019                                                                  # 
+# copyright @ miRcore                                                         #
+#                                                                             #
+###############################################################################
+
 import argparse
 import io
 import sys
+import subprocess
 import threading
 import queue
 
@@ -24,16 +34,16 @@ def parseArgs():
     parser.add_argument('-i', '--input',   required=True,
                         help="The path to the file with the relative positions.")
 
-    return parser.parse_args();
+    return parser.parse_args()
 
 
 def parseNMID(string):
     """Parse out NM_ID from string."""
 
     # assert that the first three characters are "NM_"
-    assert(string[0:3] == "NM_"), "NM_ID is incorrectly formatted"
+    assert(string[0:3] == "NM_" or string[0:3] == "NR_"), "NM_ID is incorrectly formatted"
 
-    nm_id_str = "NM_"
+    nm_id_str = string[0:3]
     i = 3
     while (i < len(string) and (string[i] >= '0' and string[i] <= '9')):
         nm_id_str += string[i]
@@ -60,20 +70,24 @@ class RefFile:
                 raise Exception("Reference file doesn't contain 6 fields") 
 
             data = {} 
-            nm_id = parseNMID(fields[3])
+            try:
+                nm_id = parseNMID(fields[3])
 
-            data["chromosome"] = fields[0]
-            data["start_pos"] = int(fields[1])
-            data["end_pos"] = int(fields[2])
-            data["nm_id_full"] = fields[3]
-            data["zero"] = int(fields[4])
-            data["strand"] = fields[5][:-1]
+                data["chromosome"] = fields[0]
+                data["start_pos"] = int(fields[1])
+                data["end_pos"] = int(fields[2])
+                data["nm_id_full"] = fields[3]
+                data["zero"] = int(fields[4])
+                data["strand"] = fields[5][:-1]
 
-            if nm_id not in self.ref:
-                self.ref[nm_id] = []
-            self.ref[nm_id].append(data)
- 
+                if nm_id not in self.ref:
+                    self.ref[nm_id] = []
+                self.ref[nm_id].append(data)
 
+            except AssertionError as e:
+                # ignore case     
+                a = 0
+                
         self.length = line_counter
 
 
@@ -99,29 +113,55 @@ def parseInputFile(input_filename, utr5_ref, utr3_ref):
     #
     ###########################################################################
 
-    t1 = threading.Thread(target=calcAbsPos, args=(input_filename, utr5_ref))
-    t2 = threading.Thread(target=calcAbsPos, args=(input_filename, utr3_ref))
-        
-    t1.start()
-    t2.start()
+    # t1 = threading.Thread(target=calcAbsPos, args=(input_filename, utr5_ref))
+    # t2 = threading.Thread(target=calcAbsPos, args=(input_filename, utr3_ref))
+    #     
+    # t1.start()
+    # t2.start()
 
-    t1.join()
-    t2.join()
+    # t1.join()
+    # t2.join()
 
-    out1 = ret_queue.get()
-    out2 = ret_queue.get()
+    # out1 = ret_queue.get()
+    # out2 = ret_queue.get()
 
+    # print(out1.getvalue() + out2.getvalue())
+    # out1.close()
+    # out2.close()
+
+    out1 = calcAbsPos(input_filename, utr5_ref)
+    out2 = calcAbsPos(input_filename, utr3_ref)
     print(out1.getvalue() + out2.getvalue())
+
     out1.close()
     out2.close()
 
+
+
 def calcAbsPos(input_filename, utr_ref):
     """Calculate the absolute position given the relative positions."""
+    
+    # sort the input file by starting position
+    cmd = ["sort", "-n", "-k"]
+    if utr_ref.utr == 5:
+        cmd.append("2,2")
+    else:
+        cmd.append("3,3")
+    cmd.append(input_filename)
+    relfile = subprocess.check_output(cmd).decode("utf-8").splitlines()
 
+    #
     # open relative position file
-    relfile = open(input_filename, 'r')
+    # relfile = open(input_filename, 'r')
+    #
+
     # open c++ style string stream
     oss = StringIO()
+
+    prevpos = 0     # previous relative start position
+    prevseq = ""    # previous sequence
+    writelines = [] # previous lines that need to be written [[],[],...]
+    writextras = [] # previous extra lines that need to be written [[],[],...]
 
     for line in relfile:
         fields = line.split('\t')
@@ -130,13 +170,62 @@ def calcAbsPos(input_filename, utr_ref):
         nm_id = parseNMID(fields[0])
         start = int(fields[1]) if utr_ref.utr == 5 else int(fields[2])
         if len(fields) > 5:
-            seq = fields[3] if utr_ref.utr == 5 else fields[4][::-1]
+            seq = fields[3]
+            seq3 = fields[4][::-1]
             extra = fields[5:]
         else:
-            seq = fields[3] if utr_ref.utr == 5 else fields[4][:-1][::-1]
+            seq = fields[3]
+            seq3 = fields[4][:-1][::-1]
             extra = None
 
         prime_string = "_5U" if utr_ref.utr == 5 else "_3U"
+
+        # add the corresponding 5'/3' sequence if the previous line had the same start / seq
+        if utr_ref.utr == 5:
+            # if we are working on 5' positions, append multiple 3' sequences 
+            # if same starting position and same sequence
+            if start == prevpos and prevseq == seq:
+                for x in range(len(writelines)):
+                    tochange = writelines[x][-1]
+                    if tochange == seq3:
+                        break
+                    tochange = tochange + "," + seq3
+                    writelines[x][-1] = tochange
+                # get the lowest energy value
+                for x in range(len(writextras)):
+                    if writextras[x] != None:
+                        energy = float(writextras[x][0])
+                        currenergy = float(extra[0])
+                        if currenergy < energy:
+                            writextras[x][0] = currenergy
+                continue
+            else:
+                writeLine(oss, writelines, writextras)
+                    
+        elif utr_ref.utr == 3:
+            # if we are working on 3' positions, append multiple 5' sequences
+            if start == prevpos and prevseq == seq3:
+                for x in range(len(writelines)):
+                    tochange = writelines[x][-2]
+                    if tochange == seq:
+                        break
+                    tochange = tochange + "," + seq
+                    writelines[x][-2] = tochange
+                # get the lowest energy value
+                for x in range(len(writextras)):
+                    if writextras[x] != None:
+                        energy = float(writextras[x][0])
+                        currenergy = float(extra[0])
+                        if currenergy < energy:
+                            writextras[x][0] = currenergy
+                continue
+            else:
+                writeLine(oss, writelines, writextras)
+
+        writelines = []
+        writextras = []
+        prevpos = start
+        prevseq = seq if utr_ref.utr == 5 else seq3
 
         # calculate absolute start position 
         if nm_id in utr_ref.ref:
@@ -167,15 +256,10 @@ def calcAbsPos(input_filename, utr_ref):
                     seq_length_remaining -= 1
                     if absolute_start == current_start: 
                         # print output for current exon segment
-                        oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
-                            str(absolute_start) + "\t" + str(absolute_end) + "\t" +
-                            nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
-                            "\t" + seq)
-                        if extra != None:
-                            for field in extra:
-                                oss.write("\t" + field)
-                        else:
-                            oss.write("\n")
+                        writelines.append([utr_ref.ref[nm_id][k]["chromosome"], str(absolute_start),
+                            str(absolute_end), nm_id + prime_string, utr_ref.ref[nm_id][k]["strand"],
+                            seq, seq3])
+                        writextras.append(extra)
                         # go to the next exon segment
                         k -= 1
                         current_end    = utr_ref.ref[nm_id][k]["end_pos"]
@@ -183,15 +267,10 @@ def calcAbsPos(input_filename, utr_ref):
                         absolute_end   = current_end
                         absolute_start = absolute_end
                 # print for the exon segment
-                oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
-                    str(absolute_start - 1) + "\t" + str(absolute_end) + "\t" +
-                    nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
-                    "\t" + seq)
-                if extra != None:
-                    for field in extra:
-                        oss.write("\t" + field)
-                else:
-                    oss.write("\n")
+                writelines.append([utr_ref.ref[nm_id][k]["chromosome"], str(absolute_start - 1),
+                    str(absolute_end), nm_id + prime_string, utr_ref.ref[nm_id][k]["strand"],
+                    seq, seq3])
+                writextras.append(extra)
             ###################################################################
             # positive strand computation
             ###################################################################
@@ -217,33 +296,40 @@ def calcAbsPos(input_filename, utr_ref):
                     seq_length_remaining -= 1
                     if absolute_end == current_end:
                         # print out for current exon segment
-                        oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
-                            str(absolute_start) + "\t" + str(absolute_end) + "\t" +
-                            nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
-                            "\t" + seq)
-                        if extra != None:
-                            for field in extra:
-                                oss.write("\t" + field)
-                        else:
-                            oss.write("\n")
+                        writelines.append([utr_ref.ref[nm_id][k]["chromosome"], str(absolute_start),
+                            str(absolute_end), nm_id + prime_string, utr_ref.ref[nm_id][k]["strand"],
+                            seq, seq3])
+                        writextras.append(extra)
                         k += 1
                         current_start  = utr_ref.ref[nm_id][k]["start_pos"]
                         current_end    = utr_ref.ref[nm_id][k]["end_pos"]
                         absolute_start = current_start
                         absolute_end   = absolute_start
                 # print for final exon segment
-                oss.write(utr_ref.ref[nm_id][k]["chromosome"] + "\t" +
-                    str(absolute_start) + "\t" + str(absolute_end + 1) + "\t" +
-                    nm_id + prime_string + "\t" + utr_ref.ref[nm_id][k]["strand"] +
-                    "\t" + seq)
-                if extra != None:
-                    for field in extra:
-                        oss.write("\t" + field)
-                else:
-                    oss.write("\n")
-    qlock.acquire()
-    ret_queue.put(oss)
-    qlock.release()
+                writelines.append([utr_ref.ref[nm_id][k]["chromosome"], str(absolute_start),
+                    str(absolute_end + 1), nm_id + prime_string, utr_ref.ref[nm_id][k]["strand"],
+                    seq, seq3])
+                writextras.append(extra)
+    writeLine(oss, writelines, writextras)
+    # qlock.acquire()
+    # ret_queue.put(oss)
+    # qlock.release()
+    return oss
+
+
+def writeLine(oss, fields, extras):
+    """write lines to string stream from fields array.
+       each element of the fields array will be delimited with tabs."""
+    if fields:    
+        for i in range(len(fields)):
+            for field in fields[i][:-1]:
+                oss.write(field + "\t")
+            oss.write(fields[i][-1])
+
+            if extras[i] != None:
+                for field in extras[i]:
+                    oss.write("\t" + str(field))
+            oss.write("\n")
 
     
 def main():
